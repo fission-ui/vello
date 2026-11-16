@@ -139,10 +139,12 @@ use crate::paint::PaintResolver;
 use crate::scene::RecordedDraw;
 use crate::schedule::allocate::AllocatedTextureRegion;
 use crate::target::{
-    DrawTarget, LayerTextureRegion, RootTarget, RoundBindings, TextureParity, TextureRegion,
+    DrawPassTarget, DrawTarget, LayerTextureRegion, RootTarget, RoundBindings, TextureParity,
+    TextureRegion,
 };
 use crate::{IntermediateTextureError, RenderError, Scene, blend::BlendStrip};
 use alloc::vec::Vec;
+use core::mem::size_of;
 use vello_common::filter::FilterLayerPlacement;
 use vello_common::geometry::{RectU16, SizeU16};
 use vello_common::peniko::BlendMode;
@@ -208,6 +210,97 @@ impl Schedule {
     pub(crate) fn intermediate_texture_requirements(&self) -> IntermediateTextureRequirements {
         self.intermediate_textures
     }
+
+    /// Return the number of bytes needed to upload all scheduled strip draws once.
+    pub(crate) fn strip_upload_size(
+        &self,
+        buffers: &ScheduleBuffers,
+        root_output_target: RootTarget,
+    ) -> Option<u64> {
+        let mut strip_count = if DrawPassTarget::Root(root_output_target).enable_opaque() {
+            buffers.draw_buffers.opaque.strips().len()
+        } else {
+            0
+        };
+
+        for round in self.rounds.iter() {
+            for pass in round.layer_passes(buffers) {
+                if let Some(draw) = pass.draw {
+                    strip_count = strip_count.checked_add(draw.strips.len())?;
+                }
+            }
+            if let Some(draw) = round.root_draw_pass(buffers, root_output_target) {
+                strip_count = strip_count.checked_add(draw.strips.len())?;
+            }
+        }
+
+        u64::try_from(strip_count)
+            .ok()?
+            .checked_mul(size_of::<crate::GpuStrip>() as u64)
+    }
+
+    /// Count the passes and intermediate allocations needed by a scheduled frame.
+    /// This is only called by the opt-in browser renderer diagnostics.
+    pub(crate) fn diagnostic_counts(
+        &self,
+        buffers: &ScheduleBuffers,
+        root_output_target: RootTarget,
+    ) -> ScheduleDiagnosticCounts {
+        let mut counts = ScheduleDiagnosticCounts {
+            rounds: self.rounds.iter().count(),
+            ..Default::default()
+        };
+
+        for round in self.rounds.iter() {
+            for pass in round.layer_passes(buffers) {
+                counts.draw_passes += usize::from(pass.draw.is_some());
+                counts.filter_passes += usize::from(pass.filter.is_some());
+                counts.blend_passes += usize::from(pass.blend.is_some());
+            }
+            counts.draw_passes +=
+                usize::from(round.root_draw_pass(buffers, root_output_target).is_some());
+            counts.clear_passes += round.clear_passes().count();
+        }
+
+        counts
+    }
+
+    /// Copy scheduled strips into one frame upload in backend execution order.
+    pub(crate) fn collect_strip_upload_data(
+        &self,
+        buffers: &ScheduleBuffers,
+        root_output_target: RootTarget,
+        output: &mut Vec<crate::GpuStrip>,
+    ) {
+        output.clear();
+        if DrawPassTarget::Root(root_output_target).enable_opaque() {
+            output.extend_from_slice(buffers.draw_buffers.opaque.strips());
+        }
+
+        for round in self.rounds.iter() {
+            for pass in round.layer_passes(buffers) {
+                if let Some(draw) = pass.draw {
+                    for strips in draw.strips.slices() {
+                        output.extend_from_slice(strips);
+                    }
+                }
+            }
+            if let Some(draw) = round.root_draw_pass(buffers, root_output_target) {
+                for strips in draw.strips.slices() {
+                    output.extend_from_slice(strips);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduleDiagnosticCounts {
+    pub(crate) rounds: usize,
+    pub(crate) draw_passes: usize,
+    pub(crate) filter_passes: usize,
+    pub(crate) blend_passes: usize,
+    pub(crate) clear_passes: usize,
 }
 
 /// Intermediate textures required to execute a [`Schedule`].

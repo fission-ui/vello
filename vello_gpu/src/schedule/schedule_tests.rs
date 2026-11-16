@@ -6,6 +6,7 @@ use super::{IntermediateTextureAllocations, IntermediateTextureRequirements, Sch
 use crate::filter::FILTER_ATLAS_PADDING;
 use crate::target::{RootTarget, TextureParity};
 use crate::{IntermediateTextureError, RenderError};
+use alloc::vec::Vec;
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_common::geometry::SizeU16;
 use vello_common::kurbo::{Rect, Shape};
@@ -203,6 +204,40 @@ fn draw_order() {
     assert_eq!(rounds_view.len(), 1);
     assert_eq!(rounds_view[0].root.x, [0, 8, 16]);
     assert!(rounds_view[0].root.has_child_layer);
+}
+
+#[test]
+fn collected_strip_upload_matches_backend_pass_order() {
+    let mut case = SceneCase::new(32, 8);
+    case.draw_at(0.0, 1.0);
+    case.layer(|case| case.draw_at(8.0, 0.5));
+    case.draw_at(16.0, 0.5);
+
+    let scheduled = case.schedule_root(true);
+    let mut expected = scheduled.opaque_x();
+    for round in scheduled.views() {
+        expected.extend(round.even.x);
+        expected.extend(round.odd.x);
+        expected.extend(round.root.x);
+    }
+
+    let mut collected = Vec::new();
+    scheduled.schedule.collect_strip_upload_data(
+        &scheduled.storage.buffers,
+        RootTarget::UserSurface,
+        &mut collected,
+    );
+
+    assert_eq!(
+        collected.iter().map(|strip| strip.x).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        scheduled
+            .schedule
+            .strip_upload_size(&scheduled.storage.buffers, RootTarget::UserSurface),
+        Some((collected.len() * size_of::<crate::GpuStrip>()) as u64)
+    );
 }
 
 #[test]

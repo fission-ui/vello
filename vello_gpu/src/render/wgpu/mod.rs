@@ -18,6 +18,9 @@
 only break in edge cases, and some of them are also only related to conversions from f64 to f32."
 )]
 
+mod strip_upload;
+mod texture_upload;
+
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
 use crate::util::RangedSlice;
@@ -163,6 +166,8 @@ pub struct Renderer {
     dummy_image_cache: Option<ImageCache>,
     schedule_storage: ScheduleStorage,
     scratch_buffers: ScratchBuffers,
+    /// CPU staging for one batched strip upload per render.
+    strip_upload_data: Vec<GpuStrip>,
     layers_config: LayersConfig,
     #[cfg(feature = "text")]
     atlas_clear_scratch: Vec<u8>,
@@ -212,6 +217,7 @@ impl Renderer {
             dummy_image_cache: Some(ImageCache::new_dummy()),
             schedule_storage: ScheduleStorage::default(),
             scratch_buffers: ScratchBuffers::default(),
+            strip_upload_data: Vec::new(),
             layers_config: layer_config,
             #[cfg(feature = "text")]
             atlas_clear_scratch: Vec::new(),
@@ -275,6 +281,68 @@ impl Renderer {
         texture_bindings: &TextureBindings,
         target_init: TargetInit<'_>,
     ) -> Result<(), RenderError> {
+        self.render_internal(
+            scene,
+            resources,
+            device,
+            queue,
+            encoder,
+            render_size,
+            view,
+            depth_view,
+            texture_bindings,
+            target_init,
+            None,
+        )
+    }
+
+    /// Render `scene`, reporting coarse phases to a diagnostic callback.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_diagnostic_callback(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        render_size: &RenderSize,
+        view: &TextureView,
+        depth_view: Option<&TextureView>,
+        texture_bindings: &TextureBindings,
+        target_init: TargetInit<'_>,
+        diagnostic: fn(u32, u32),
+    ) -> Result<(), RenderError> {
+        self.render_internal(
+            scene,
+            resources,
+            device,
+            queue,
+            encoder,
+            render_size,
+            view,
+            depth_view,
+            texture_bindings,
+            target_init,
+            Some(diagnostic),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_internal(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        render_size: &RenderSize,
+        view: &TextureView,
+        depth_view: Option<&TextureView>,
+        texture_bindings: &TextureBindings,
+        target_init: TargetInit<'_>,
+        diagnostic: Option<fn(u32, u32)>,
+    ) -> Result<(), RenderError> {
         #[cfg(feature = "text")]
         {
             resources.before_render(
@@ -288,6 +356,7 @@ impl Renderer {
                         queue,
                         atlas_id,
                         texture_bindings,
+                        diagnostic,
                     )
                 },
                 |renderer, image_cache, upload, dst_x, dst_y| {
@@ -305,6 +374,9 @@ impl Renderer {
                 },
             )?;
         }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(518, 0);
+        }
 
         let result = self.render_scene(
             scene,
@@ -319,7 +391,11 @@ impl Renderer {
             target_init,
             RootTarget::UserSurface,
             texture_bindings,
+            diagnostic,
         );
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(519, 0);
+        }
 
         #[cfg(feature = "text")]
         resources.after_render(self, |renderer, rect| {
@@ -327,6 +403,9 @@ impl Renderer {
 
             Ok::<(), RenderError>(())
         })?;
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(520, 0);
+        }
         result
     }
 
@@ -358,6 +437,7 @@ impl Renderer {
         queue: &Queue,
         atlas_id: AtlasId,
         texture_bindings: &TextureBindings,
+        diagnostic: Option<fn(u32, u32)>,
     ) -> Result<(), RenderError> {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render to Atlas Encoder"),
@@ -392,11 +472,15 @@ impl Renderer {
             TargetInit::SrcOver,
             RootTarget::AtlasLayer,
             texture_bindings,
+            diagnostic,
         );
         self.dummy_image_cache = Some(dummy_image_cache);
 
         // Submit immediately so the atlas content is committed before subsequent
         // render() calls overwrite the shared alpha/config/paint resources.
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(572, 1);
+        }
         queue.submit(Some(encoder.finish()));
 
         result
@@ -430,6 +514,7 @@ impl Renderer {
         target_init: TargetInit<'_>,
         root_output_target: RootTarget,
         texture_bindings: &TextureBindings,
+        diagnostic: Option<fn(u32, u32)>,
     ) -> Result<(), RenderError> {
         self.programs.depth_cleared_this_frame = false;
         self.prepare_gpu_encoded_paints(
@@ -438,6 +523,9 @@ impl Renderer {
             texture_bindings,
             view.texture(),
         )?;
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(521, 0);
+        }
         let required_texture_size = self
             .layers_config
             .required_intermediate_texture_size(&scene.recorder)?;
@@ -462,11 +550,140 @@ impl Renderer {
             current_allocations,
             self.layers_config.max_textures,
         )?;
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(522, 0);
+            let counts =
+                schedule.diagnostic_counts(&self.schedule_storage.buffers, root_output_target);
+            let requirements = schedule.intermediate_texture_requirements();
+            diagnostic(561, counts.rounds.try_into().unwrap_or(u32::MAX));
+            diagnostic(562, counts.draw_passes.try_into().unwrap_or(u32::MAX));
+            diagnostic(563, counts.filter_passes.try_into().unwrap_or(u32::MAX));
+            diagnostic(564, counts.blend_passes.try_into().unwrap_or(u32::MAX));
+            diagnostic(565, counts.clear_passes.try_into().unwrap_or(u32::MAX));
+            diagnostic(
+                567,
+                requirements.allocations.layer_pages[0]
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            );
+            diagnostic(
+                568,
+                requirements.allocations.layer_pages[1]
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            );
+            diagnostic(569, u32::from(requirements.allocations.scratch));
+        }
+        let required_strip_upload_size = schedule
+            .strip_upload_size(&self.schedule_storage.buffers, root_output_target)
+            .unwrap_or(u64::MAX);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(
+                527,
+                required_strip_upload_size.try_into().unwrap_or(u32::MAX),
+            );
+            diagnostic(
+                566,
+                (required_strip_upload_size / size_of::<GpuStrip>() as u64)
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            );
+        }
+        let batch_strip_uploads = required_strip_upload_size <= device.limits().max_buffer_size;
+        self.strip_upload_data.clear();
+        if batch_strip_uploads {
+            schedule.collect_strip_upload_data(
+                &self.schedule_storage.buffers,
+                root_output_target,
+                &mut self.strip_upload_data,
+            );
+            debug_assert_eq!(
+                self.strip_upload_data.len() * size_of::<GpuStrip>(),
+                usize::try_from(required_strip_upload_size).unwrap(),
+                "scheduled strip upload size must match the collected strip data"
+            );
+            if let Some(diagnostic) = diagnostic {
+                diagnostic(
+                    539,
+                    required_strip_upload_size.try_into().unwrap_or(u32::MAX),
+                );
+            }
+            self.programs
+                .allocate_strips_buffer_for_frame(device, required_strip_upload_size);
+            if let Some(diagnostic) = diagnostic {
+                diagnostic(
+                    540,
+                    required_strip_upload_size.try_into().unwrap_or(u32::MAX),
+                );
+            }
+            if !self.strip_upload_data.is_empty() {
+                let strip_upload_bytes = bytemuck::cast_slice(&self.strip_upload_data);
+                let mut pending_chunks = 0;
+                let mut ranges = strip_upload::strip_upload_ranges(
+                    required_strip_upload_size,
+                    device.limits().max_buffer_size,
+                );
+                while let Some(range) = ranges.next() {
+                    let bytes = &strip_upload_bytes[range.start as usize..range.end as usize];
+                    if let Some(diagnostic) = diagnostic {
+                        diagnostic(541, range.start.try_into().unwrap_or(u32::MAX));
+                        diagnostic(544, bytes.len().try_into().unwrap_or(u32::MAX));
+                    }
+                    queue.write_buffer(&self.programs.resources.strips_buffer, range.start, bytes);
+                    if let Some(diagnostic) = diagnostic {
+                        diagnostic(542, range.start.try_into().unwrap_or(u32::MAX));
+                    }
+                    pending_chunks += 1;
+                    if strip_upload::should_submit_strip_writes(pending_chunks) {
+                        if let Some(diagnostic) = diagnostic {
+                            diagnostic(548, range.end.try_into().unwrap_or(u32::MAX));
+                            diagnostic(572, 2);
+                        }
+                        // Queue writes are ordered before subsequent submissions. Flush these
+                        // copies without waiting for completion before recording the frame's draw
+                        // commands, which remain ordered after them on the same queue.
+                        queue.submit([]);
+                        if let Some(diagnostic) = diagnostic {
+                            diagnostic(549, range.end.try_into().unwrap_or(u32::MAX));
+                        }
+                        pending_chunks = 0;
+                    }
+                }
+                if pending_chunks > 0 {
+                    if let Some(diagnostic) = diagnostic {
+                        diagnostic(
+                            548,
+                            required_strip_upload_size.try_into().unwrap_or(u32::MAX),
+                        );
+                        diagnostic(572, 2);
+                    }
+                    queue.submit([]);
+                    if let Some(diagnostic) = diagnostic {
+                        diagnostic(
+                            549,
+                            required_strip_upload_size.try_into().unwrap_or(u32::MAX),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(543, 0);
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(528, 0);
+        }
         self.programs
             .prepare_intermediate_textures(device, queue, &schedule);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(529, 0);
+        }
         // TODO: For the time being, we upload the entire alpha buffer as one big chunk. As a future
         // refinement, we could have a bounded alpha buffer, and break draws when the alpha
         // buffer fills.
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(530, 0);
+        }
         self.programs.prepare(
             device,
             queue,
@@ -476,7 +693,11 @@ impl Renderer {
             render_size,
             &self.paint_idxs,
             &self.schedule_storage.filter_context,
+            diagnostic,
         );
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(523, 0);
+        }
 
         let mut ctx = RendererContext {
             programs: &mut self.programs,
@@ -488,10 +709,14 @@ impl Renderer {
             texture_bindings,
             external_texture_bind_groups: HashMap::new(),
             scratch_buffers: &mut self.scratch_buffers,
+            strip_upload_offset: batch_strip_uploads.then_some(0),
             root_load_op: wgpu::LoadOp::Load,
         };
 
         ctx.init_root_clear(target_init, root_output_target);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(524, 0);
+        }
 
         crate::schedule::execute(
             &mut ctx,
@@ -500,10 +725,26 @@ impl Renderer {
             root_output_target,
         )
         .unwrap_or_else(|error| match error {});
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(525, 0);
+        }
 
         ctx.finish_root_clear();
+        let strip_upload_offset = ctx.strip_upload_offset;
+        drop(ctx);
+
+        if batch_strip_uploads {
+            debug_assert_eq!(
+                strip_upload_offset,
+                Some(required_strip_upload_size),
+                "scheduled strip ranges must match the collected strip data"
+            );
+        }
 
         self.gradient_cache.maintain();
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(526, 0);
+        }
 
         Ok(())
     }
@@ -1785,6 +2026,16 @@ impl Programs {
         })
     }
 
+    fn allocate_strips_buffer_for_frame(&mut self, device: &Device, required_size: u64) {
+        if required_size == 0 {
+            return;
+        }
+
+        // Keep the destination GPU buffer unmapped. CPU strip data is uploaded in bounded
+        // queue.write_buffer chunks so the frame does not require a large single queue write.
+        self.resources.strips_buffer = Self::create_strips_buffer(device, required_size);
+    }
+
     fn create_intermediate_texture(
         device: &Device,
         size: SizeU16,
@@ -2190,21 +2441,37 @@ impl Programs {
         new_render_size: &RenderSize,
         paint_idxs: &[u32],
         filter_context: &FilterContext,
+        diagnostic: Option<fn(u32, u32)>,
     ) {
         let resource_texture_dimension_2d = self.resources.resource_texture_dimension_2d;
         self.maybe_resize_alphas_tex(device, resource_texture_dimension_2d, alphas.len());
         self.maybe_resize_encoded_paints_tex(device, resource_texture_dimension_2d, paint_idxs);
         self.maybe_resize_filter_tex(device, resource_texture_dimension_2d, filter_context);
         self.maybe_update_config_buffer(queue, resource_texture_dimension_2d, new_render_size);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(531, alphas.len().try_into().unwrap_or(u32::MAX));
+        }
 
-        self.upload_alpha_texture(queue, alphas);
-        self.upload_encoded_paints_texture(queue, encoded_paints);
-        self.upload_filter_texture(queue, filter_context);
+        self.upload_alpha_texture(queue, alphas, diagnostic);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(532, 0);
+        }
+        self.upload_encoded_paints_texture(queue, encoded_paints, diagnostic);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(533, 0);
+        }
+        self.upload_filter_texture(queue, filter_context, diagnostic);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(534, 0);
+        }
 
         if gradient_cache.has_changed() {
             self.maybe_resize_gradient_tex(device, resource_texture_dimension_2d, gradient_cache);
-            self.upload_gradient_texture(queue, gradient_cache);
+            self.upload_gradient_texture(queue, gradient_cache, diagnostic);
             gradient_cache.mark_synced();
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic(535, 0);
         }
     }
 
@@ -2417,7 +2684,12 @@ impl Programs {
     }
 
     /// Upload alpha data to the texture.
-    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: &mut Vec<u8>) {
+    fn upload_alpha_texture(
+        &mut self,
+        queue: &Queue,
+        alphas: &mut Vec<u8>,
+        diagnostic: Option<fn(u32, u32)>,
+    ) {
         if alphas.is_empty() {
             return;
         }
@@ -2431,26 +2703,19 @@ impl Programs {
         // Temporarily pad the length of the alphas to the texture size before uploading.
         alphas.resize(total_size, 0);
 
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.resources.alphas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        texture_upload::write_texture_data(
+            queue,
+            &self.resources.alphas_texture,
+            wgpu::Origin3d::ZERO,
             alphas,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), which is equivalent to
-                // a bit shift of 4.
-                bytes_per_row: Some(texture_width << 4),
-                rows_per_image: Some(texture_height),
-            },
+            texture_width << 4,
+            texture_height,
             Extent3d {
                 width: texture_width,
                 height: texture_height,
                 depth_or_array_layers: 1,
             },
+            diagnostic,
         );
 
         // Truncate back to the original size.
@@ -2458,35 +2723,39 @@ impl Programs {
     }
 
     /// Upload encoded paints to the texture.
-    fn upload_encoded_paints_texture(&mut self, queue: &Queue, encoded_paints: &[GpuEncodedPaint]) {
+    fn upload_encoded_paints_texture(
+        &mut self,
+        queue: &Queue,
+        encoded_paints: &[GpuEncodedPaint],
+        diagnostic: Option<fn(u32, u32)>,
+    ) {
         let encoded_paints_texture = &self.resources.encoded_paints_texture;
         let encoded_paints_texture_width = encoded_paints_texture.width();
         let encoded_paints_texture_height = encoded_paints_texture.height();
 
         GpuEncodedPaint::serialize_to_buffer(encoded_paints, &mut self.encoded_paints_data);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: encoded_paints_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        texture_upload::write_texture_data(
+            queue,
+            encoded_paints_texture,
+            wgpu::Origin3d::ZERO,
             &self.encoded_paints_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), equivalent to bit shift of 4
-                bytes_per_row: Some(encoded_paints_texture_width << 4),
-                rows_per_image: Some(encoded_paints_texture_height),
-            },
+            encoded_paints_texture_width << 4,
+            encoded_paints_texture_height,
             Extent3d {
                 width: encoded_paints_texture_width,
                 height: encoded_paints_texture_height,
                 depth_or_array_layers: 1,
             },
+            diagnostic,
         );
     }
 
-    fn upload_filter_texture(&mut self, queue: &Queue, filter_context: &FilterContext) {
+    fn upload_filter_texture(
+        &mut self,
+        queue: &Queue,
+        filter_context: &FilterContext,
+        diagnostic: Option<fn(u32, u32)>,
+    ) {
         if filter_context.is_empty() {
             return;
         }
@@ -2496,29 +2765,29 @@ impl Programs {
         let height = filter_texture.height();
 
         filter_context.serialize_to_buffer(&mut self.filter_data);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: filter_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        texture_upload::write_texture_data(
+            queue,
+            filter_texture,
+            wgpu::Origin3d::ZERO,
             &self.filter_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width << 4),
-                rows_per_image: Some(height),
-            },
+            width << 4,
+            height,
             Extent3d {
                 width,
                 height,
                 depth_or_array_layers: 1,
             },
+            diagnostic,
         );
     }
 
     /// Upload gradient data to the texture.
-    fn upload_gradient_texture(&mut self, queue: &Queue, gradient_cache: &mut GradientRampCache) {
+    fn upload_gradient_texture(
+        &mut self,
+        queue: &Queue,
+        gradient_cache: &mut GradientRampCache,
+        diagnostic: Option<fn(u32, u32)>,
+    ) {
         let gradient_texture = &self.resources.gradient_texture;
         let gradient_texture_width = gradient_texture.width();
         let gradient_texture_height = gradient_texture.height();
@@ -2532,25 +2801,19 @@ impl Programs {
             let old_luts_len = luts.len();
             luts.resize(total_capacity, 0);
 
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: gradient_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
+            texture_upload::write_texture_data(
+                queue,
+                gradient_texture,
+                wgpu::Origin3d::ZERO,
                 &luts,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    // 4 bytes per RGBA8 pixel
-                    bytes_per_row: Some(gradient_texture_width << 2),
-                    rows_per_image: Some(gradient_texture_height),
-                },
+                gradient_texture_width << 2,
+                gradient_texture_height,
                 Extent3d {
                     width: gradient_texture_width,
                     height: gradient_texture_height,
                     depth_or_array_layers: 1,
                 },
+                diagnostic,
             );
 
             // Restore the luts back to the cache
@@ -2566,7 +2829,7 @@ impl Programs {
         queue: &Queue,
         opaque_strips: &[GpuStrip],
         alpha_strips: RangedSlice<'_, GpuStrip>,
-    ) {
+    ) -> core::ops::Range<u64> {
         let opaque_len = size_of_val(opaque_strips) as u64;
         let alpha_len = (alpha_strips.len() * size_of::<GpuStrip>()) as u64;
         let total_len = opaque_len + alpha_len;
@@ -2590,6 +2853,7 @@ impl Programs {
                 .copy_from_slice(bytes);
             offset += bytes.len();
         }
+        0..total_len
     }
 }
 
@@ -2605,6 +2869,7 @@ struct RendererContext<'a> {
     texture_bindings: &'a TextureBindings,
     external_texture_bind_groups: HashMap<ExternalTextureBindings, BindGroup>,
     scratch_buffers: &'a mut ScratchBuffers,
+    strip_upload_offset: Option<u64>,
     root_load_op: wgpu::LoadOp<wgpu::Color>,
 }
 
@@ -2698,15 +2963,18 @@ impl RendererContext<'_> {
         if opaque_count == 0 && alpha_count == 0 {
             return;
         }
-        // TODO: We currently allocate a new strips buffer for each render pass. A more efficient
-        // approach would be to re-use buffers or slices of a larger buffer.
+        // Oversized schedules use the per-pass fallback; normal schedules share one frame buffer.
         // Create bind groups for all external textures used by this pass.
         for run in external_texture_runs {
             self.external_texture_bind_group_for_textures(run.bindings);
         }
 
-        self.programs
-            .upload_strip_pair(self.device, self.queue, opaque_strips, alpha_strips);
+        let vertex_buffer_range = if let Some(offset) = self.strip_upload_offset.as_mut() {
+            strip_upload::reserve_strip_pair(offset, opaque_strips, alpha_strips)
+        } else {
+            self.programs
+                .upload_strip_pair(self.device, self.queue, opaque_strips, alpha_strips)
+        };
         let opaque_count = opaque_count as u32;
         let alpha_count = alpha_count as u32;
 
@@ -2799,7 +3067,13 @@ impl RendererContext<'_> {
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_bind_group(2, &self.programs.resources.encoded_paints_bind_group, &[]);
         render_pass.set_bind_group(3, &self.programs.resources.gradient_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.programs.resources.strips_buffer.slice(..));
+        render_pass.set_vertex_buffer(
+            0,
+            self.programs
+                .resources
+                .strips_buffer
+                .slice(vertex_buffer_range),
+        );
 
         let draw_strip_runs = |render_pass: &mut wgpu::RenderPass<'_>, first_instance, count| {
             if external_texture_runs.is_empty() {
