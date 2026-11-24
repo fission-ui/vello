@@ -63,6 +63,15 @@ checked-out fork through path dependencies, with registry versions retained for
 crate publication. Do not replace one renderer dependency with a separate Git
 source: doing so can link two copies of shared Vello types.
 
+The five packages in that graph explicitly declare this workspace as their
+root. Keep those declarations: external Git consumers can put `CARGO_HOME`
+inside their own workspace, where Cargo's cached workspace lookup can otherwise
+try to inherit manifest fields from the consumer instead of Vello.
+
+Before publishing Fission crates that depend on new fork behavior, publish the
+changed fork packages and update Fission's registry version requirements. A
+passing submodule build does not test the versions a crates.io consumer gets.
+
 Git still records the tested submodule commit. A tracking branch is the source
 of updates, not permission to change a build's source halfway through it:
 

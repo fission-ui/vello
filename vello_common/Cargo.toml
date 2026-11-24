@@ -1,4 +1,5 @@
 [package]
+workspace = ".."
 name = "fission-vello-common"
 # When updating, also update the version in the workspace dependency in the root Cargo.toml
 version = "0.2.0-fission.1"

@@ -1,4 +1,5 @@
 [package]
+workspace = ".."
 name = "fission-glifo"
 version = "0.3.0-fission.1"
 description = "Glifo provides APIs for efficiently rendering text."
