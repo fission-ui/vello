@@ -41,6 +41,21 @@ Unit tests do not establish browser or graphics-driver compatibility. Also run
 the fork's rendered CPU/GPU filter comparisons and Fission's renderer/input
 integration suites when changing the relevant paths.
 
+The reconciled snapshot also passed 622 rendered filter comparisons and 68
+rendered scheduler comparisons on CPU and Mesa software Vulkan. The suites
+explicitly skipped 387 and 31 unavailable SIMD/configuration variants,
+respectively; these are not browser WebGPU results. Fetch the real Git LFS
+reference images before running image comparisons; pointer files are not PNGs.
+
+```sh
+git -C third_party/vello lfs pull \
+  --include='vello_tests/snapshots/*.png,vello_tests/tests/assets/*,assets/*/*.ttf'
+cargo test --locked --manifest-path third_party/vello/Cargo.toml \
+  -p vello_tests --test tests filter:: -- --test-threads=1
+cargo test --locked --manifest-path third_party/vello/Cargo.toml \
+  -p vello_tests --test tests hybrid_schedule:: -- --test-threads=1
+```
+
 ## Updating Fission
 
 Fission's `.gitmodules` tracks `fission`. Its Cargo manifests use the single
