@@ -1,8 +1,9 @@
 # Fission's Vello fork
 
-`fission` is the integration branch for Fission's renderer changes. Start new
-fixes from this branch and merge them back here. Application repositories should
-not select an old topic branch to recover one fix while losing another.
+`fission-integration` is the integration branch for Fission's renderer changes.
+Start new fixes from this branch and merge them back here. Application
+repositories should not select an old topic branch to recover one fix while
+losing another. The integration branch leaves existing `fission/*` refs intact.
 
 ## Reconciled branches
 
@@ -58,7 +59,7 @@ cargo test --locked --manifest-path third_party/vello/Cargo.toml \
 
 ## Updating Fission
 
-Fission's `.gitmodules` tracks `fission`. Its Cargo manifests use the single
+Fission's `.gitmodules` tracks `fission-integration`. Its Cargo manifests use the single
 checked-out fork through path dependencies, with registry versions retained for
 crate publication. Do not replace one renderer dependency with a separate Git
 source: doing so can link two copies of shared Vello types.
