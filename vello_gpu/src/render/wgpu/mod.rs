@@ -2834,25 +2834,31 @@ impl Programs {
         let alpha_len = (alpha_strips.len() * size_of::<GpuStrip>()) as u64;
         let total_len = opaque_len + alpha_len;
         self.resources.strips_buffer = Self::create_strips_buffer(device, total_len);
-        // TODO: Consider using a staging belt to avoid an extra staging buffer allocation.
-        let mut buffer_view = queue
-            .write_buffer_with(
-                &self.resources.strips_buffer,
-                0,
-                total_len.try_into().unwrap(),
-            )
-            .expect("Capacity handled in creation");
-        buffer_view
-            .slice(..opaque_len as usize)
-            .copy_from_slice(bytemuck::cast_slice(opaque_strips));
-        let mut offset = opaque_len as usize;
-        for strips in alpha_strips.slices() {
+        // Oversized schedules take this per-pass path instead of the batched frame upload.
+        // Apply the same bounded writes here: falling back must not restore the large
+        // write_buffer_with staging allocation that the frame upload avoids.
+        let mut offset = 0;
+        let mut pending_chunks = 0;
+        for strips in core::iter::once(opaque_strips).chain(alpha_strips.slices()) {
             let bytes = bytemuck::cast_slice(strips);
-            buffer_view
-                .slice(offset..offset + bytes.len())
-                .copy_from_slice(bytes);
-            offset += bytes.len();
+            for range in strip_upload::strip_upload_ranges(
+                bytes.len() as u64,
+                device.limits().max_buffer_size,
+            ) {
+                let chunk = &bytes[range.start as usize..range.end as usize];
+                queue.write_buffer(&self.resources.strips_buffer, offset, chunk);
+                offset += chunk.len() as u64;
+                pending_chunks += 1;
+                if strip_upload::should_submit_strip_writes(pending_chunks) {
+                    queue.submit([]);
+                    pending_chunks = 0;
+                }
+            }
         }
+        if pending_chunks > 0 {
+            queue.submit([]);
+        }
+        debug_assert_eq!(offset, total_len);
         0..total_len
     }
 }
